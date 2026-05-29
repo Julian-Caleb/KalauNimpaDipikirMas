@@ -1,0 +1,10 @@
+gradio
+torch
+torchvision
+timm
+transformers
+easyocr
+Pillow
+ftfy
+emoji
+wordfreq
