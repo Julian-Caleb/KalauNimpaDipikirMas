@@ -9,19 +9,66 @@ from config import DEVICE, BERT_MODEL, MAX_SEQ_LEN
 from model import MultimodalFakeNewsDetector
 from preprocessing import preprocess_ocr_text, eval_transform
 
-state = {"model": None, "tokenizer": None, "ocr_reader": None, "mode": None, "label_map": None}
+# List of models
+MODEL_REGISTRY = [
+    ("Multimodal",   "model/multimodal.pt",   "multimodal",  "Fake", "Real"),
+    ("Vision",   "model/vision.pt",   "vision_only",  "Fake", "Real"),
+    ("Text",   "model/text.pt",   "text_only",  "Fake", "Real"),
+]
+
+_PLACEHOLDER = "(Pilih model)"
+DROPDOWN_CHOICES = [_PLACEHOLDER] + [entry[0] for entry in MODEL_REGISTRY]
+_REGISTRY_MAP = {entry[0]: entry for entry in MODEL_REGISTRY}
+
+# Application state
+state = {
+    "model":      None,
+    "tokenizer":  None,
+    "ocr_reader": None,
+    "mode":       None,
+    "label_map":  None,
+}
 
 
-def load_model(model_path, mode, label_fake, label_real):
+def load_model(model_name):
+    if model_name == _PLACEHOLDER or model_name is None:
+        return "⚠️ Pilih model terlebih dahulu."
+
+    _, model_path, mode, label_fake, label_real = _REGISTRY_MAP[model_name]
+
     try:
         tokenizer  = BertTokenizer.from_pretrained(BERT_MODEL)
         ocr_reader = easyocr.Reader(["id", "en"], gpu=torch.cuda.is_available())
-        model      = MultimodalFakeNewsDetector(mode=mode).to(DEVICE)
-        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+
+        model = MultimodalFakeNewsDetector(mode=mode).to(DEVICE)
+
+        # weights_only=False agar checkpoint lama (non-safetensors) tetap bisa dimuat
+        ckpt = torch.load(model_path, map_location=DEVICE, weights_only=False)
+
+        # Tangani format checkpoint: dict terbungkus maupun state_dict langsung
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+        else:
+            state_dict = ckpt
+
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
-        state.update(model=model, tokenizer=tokenizer, ocr_reader=ocr_reader,
-                     mode=mode, label_map={0: label_fake, 1: label_real})
-        return f"✅ Model berhasil dimuat\nMode: {mode} | Device: {DEVICE}"
+
+        state.update(
+            model=model,
+            tokenizer=tokenizer,
+            ocr_reader=ocr_reader,
+            mode=mode,
+            label_map={0: label_fake, 1: label_real},
+        )
+        return f"✅ Model berhasil dimuat\nNama  : {model_name}\nMode  : {mode}"
+
+    except FileNotFoundError:
+        return f"❌ File tidak ditemukan:\n{model_path}"
+    except RuntimeError as e:
+        return f"❌ Gagal memuat bobot model (kemungkinan arsitektur tidak cocok):\n{e}"
     except Exception as e:
         return f"❌ Gagal memuat model:\n{e}"
 
@@ -31,12 +78,24 @@ def classify(image):
         return "⚠️ Model belum dimuat. Muat model terlebih dahulu."
     if image is None:
         return "⚠️ Unggah citra terlebih dahulu."
+
     try:
-        img_t  = eval_transform(Image.fromarray(image).convert("RGB")).unsqueeze(0).to(DEVICE)
-        text   = preprocess_ocr_text(
-            " ".join(state["ocr_reader"].readtext(image, detail=0, paragraph=True)))
-        enc    = state["tokenizer"](text, max_length=MAX_SEQ_LEN, padding="max_length",
-                                    truncation=True, return_tensors="pt")
+        img_t = eval_transform(
+            Image.fromarray(image).convert("RGB")
+        ).unsqueeze(0).to(DEVICE)
+
+        raw_text = " ".join(
+            state["ocr_reader"].readtext(image, detail=0, paragraph=True)
+        )
+        text = preprocess_ocr_text(raw_text)
+
+        enc = state["tokenizer"](
+            text,
+            max_length=MAX_SEQ_LEN,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
         input_ids      = enc["input_ids"].to(DEVICE)
         attention_mask = enc["attention_mask"].to(DEVICE)
 
@@ -45,42 +104,131 @@ def classify(image):
             probs  = F.softmax(logits, dim=-1)[0]
             pred   = logits.argmax(dim=-1).item()
 
-        lf, lr = state["label_map"][0], state["label_map"][1]
-        return (f"Prediksi  : {state['label_map'][pred]}\n"
-                f"{lf:<12}: {probs[0].item()*100:.1f}%\n"
-                f"{lr:<12}: {probs[1].item()*100:.1f}%\n"
-                f"Teks OCR  : {text if text else '(tidak terdeteksi)'}")
+        lf = state["label_map"][0]
+        lr = state["label_map"][1]
+
+        return (
+            f"Prediksi  : {state['label_map'][pred]}\n"
+            f"{lf:<12}: {probs[0].item() * 100:.1f}%\n"
+            f"{lr:<12}: {probs[1].item() * 100:.1f}"
+        )
+
     except Exception as e:
         return f"❌ Error saat klasifikasi:\n{e}"
 
+# Gradio UI 
+css = """
+.container {
+    max-width: 1200px;
+    margin: auto;
+}
 
-with gr.Blocks(title="Deteksi Citra Berita") as demo:
-    gr.Markdown("## DETEKSI CITRA BERITA MENGANDUNG TEKS")
+.section-title {
+    padding-left: 10px;
+}
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            image_input  = gr.Image(label="Citra", height=320)
-            btn_classify = gr.Button("KLASIFIKASI", variant="primary")
+.section-title h3 {
+    margin-top: 6px;
+    margin-bottom: 6px;
+}
 
-        with gr.Column(scale=1):
+@media (max-width: 768px) {
+    .section-title {
+        padding-left: 8px;
+    }
+
+    .section-title h3 {
+        font-size: 1rem;
+    }
+}
+"""
+
+with gr.Blocks(
+    title="Deteksi Citra Berita",
+    css=css,
+    theme=gr.themes.Default(),
+) as demo:
+
+    gr.Markdown(
+        """
+        # DETEKSI CITRA BERITA MENGANDUNG TEKS
+        """
+    )
+
+    with gr.Row(equal_height=True):
+
+        # Load Image & Classify Button
+        with gr.Column(scale=1, min_width=350):
+
+            image_input = gr.Image(
+                label="Citra",
+                height=320,
+                type="numpy"
+            )
+
+            btn_classify = gr.Button(
+                "KLASIFIKASI",
+                variant="primary"
+            )
+
+        # Model Info & Classification Result
+        with gr.Column(scale=1, min_width=350):
+
+            # Load Model
             with gr.Group():
-                gr.Markdown("**MODEL YANG DIGUNAKAN**")
-                model_path  = gr.Textbox(label="Path Model (.pt)", placeholder="model/vision_only.pt")
-                mode_select = gr.Radio(["multimodal", "vision_only", "text_only"],
-                                       label="Mode", value="multimodal")
-                with gr.Row():
-                    label_fake = gr.Textbox(label="Label Kelas 0 (Fake)", value="Fake")
-                    label_real = gr.Textbox(label="Label Kelas 1 (Real)", value="Real")
-                btn_load   = gr.Button("MUAT MODEL")
-                model_info = gr.Textbox(label="Status Model", interactive=False)
 
+                gr.HTML("""
+                <div class="section-title">
+                    <h3>MODEL YANG DIGUNAKAN</h3>
+                </div>
+                """)
+
+                model_select = gr.Dropdown(
+                    choices=DROPDOWN_CHOICES,
+                    value=_PLACEHOLDER,
+                    label="Pilih Model"
+                )
+
+                btn_load = gr.Button(
+                    "MUAT MODEL", 
+                    variant="primary"
+)
+
+                model_info = gr.Textbox(
+                    label=None,
+                    show_label=False,
+                    interactive=False,
+                    lines=3
+                )
+
+            # Classification Result
             with gr.Group():
-                gr.Markdown("**HASIL KLASIFIKASI**")
-                result_box = gr.Textbox(label="", interactive=False, lines=5)
 
-    btn_load.click(load_model, inputs=[model_path, mode_select, label_fake, label_real],
-                   outputs=model_info)
-    btn_classify.click(classify, inputs=image_input, outputs=result_box)
+                gr.HTML("""
+                <div class="section-title">
+                    <h3>HASIL KLASIFIKASI</h3>
+                </div>
+                """)
+
+                result_box = gr.Textbox(
+                    label=None,
+                    show_label=False,
+                    interactive=False,
+                    lines=6
+                )
+
+    # Events
+    btn_load.click(
+        fn=load_model,
+        inputs=model_select,
+        outputs=model_info
+    )
+
+    btn_classify.click(
+        fn=classify,
+        inputs=image_input,
+        outputs=result_box
+    )
 
 if __name__ == "__main__":
     demo.launch()
