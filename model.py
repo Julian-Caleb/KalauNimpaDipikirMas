@@ -1,119 +1,126 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
 from transformers import BertModel
-from config import VISION_MODEL, BERT_MODEL, FUSION_DIM, DROP_RATE, NUM_ATTN_HEADS
+from config import VISION_MODEL_NAME, BERT_MODEL_NAME, FUSION_DIM, DROP_RATE
 
 
-# Scaled dot-product attention with learnable W_Q, W_K, W_V projections.
-# Follows Tuan & Pham (2021): Q = q × W_Q, K = k × W_K, V = v × W_V
-# Attention(Q, K, V) = softmax((Q × K^T) / sqrt(d_k)) × V
-#
-# Supports both:
-#   - vector input  (B, D)        → unsqueeze to (B, 1, D) for single-token attention
-#   - sequence input (B, seq, D)  → used directly for region-level attention
+# Scaled dot-product attention module for fusion
 class ScaledDotProductAttention(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, attn_dropout: float = 0.1):
         super().__init__()
         self.scale = dim ** -0.5
 
-        # Learnable projection matrices W_Q, W_K, W_V (Tuan & Pham 2021, Sec. III-C)
         self.W_Q = nn.Linear(dim, dim, bias=False)
         self.W_K = nn.Linear(dim, dim, bias=False)
         self.W_V = nn.Linear(dim, dim, bias=False)
 
-        # Pre-LN on Q before projection — stabilises training (not in paper, added for stability)
         self.norm_q = nn.LayerNorm(dim)
+
+        # Attention weight dropout
+        self.attn_drop = nn.Dropout(attn_dropout)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         is_vec = (q.dim() == 2)
 
         # Promote vectors to sequences for unified bmm path
         if is_vec:
-            q = q.unsqueeze(1)   # (B, 1, D)
+            q = q.unsqueeze(1)  
         if k.dim() == 2:
-            k = k.unsqueeze(1)   # (B, 1, D)
+            k = k.unsqueeze(1)  
         if v.dim() == 2:
-            v = v.unsqueeze(1)   # (B, 1, D)
+            v = v.unsqueeze(1)  
 
-        # Pre-LN on Q
         q = self.norm_q(q)
 
-        # Learnable projections: Q = q × W_Q, K = k × W_K, V = v × W_V
-        Q = self.W_Q(q)   # (B, seq_q, D)
-        K = self.W_K(k)   # (B, seq_k, D)
-        V = self.W_V(v)   # (B, seq_v, D)
+        Q = self.W_Q(q) 
+        K = self.W_K(k) 
+        V = self.W_V(v) 
 
-        # Attention: softmax((Q × K^T) / sqrt(d_k)) × V
-        scores  = torch.bmm(Q, K.transpose(1, 2)) * self.scale   # (B, seq_q, seq_k)
-        weights = torch.softmax(scores, dim=-1)                   # (B, seq_q, seq_k)
-        out     = torch.bmm(weights, V)                           # (B, seq_q, D)
+        # Attention
+        scores  = torch.bmm(Q, K.transpose(1, 2)) * self.scale 
+        weights = self.attn_drop(torch.softmax(scores, dim=-1)) 
+        out     = torch.bmm(weights, V)                         
 
         # Return to original shape
         if is_vec:
-            out = out.squeeze(1)   # (B, D)
+            out = out.squeeze(1)  
 
         return out
 
-# Five-input fusion module from Tuan & Pham (2021), Section III-C and III-D.
+
+# Five-input fusion module from Tuan & Pham (2021)
 #
-# Tf    : Final text feature vector  (BERT [CLS], projected to fusion_dim)
-# If    : Final image feature vector (EfficientNetV2, projected to fusion_dim)
-# RTI   : text (Tf) queries image (Im) — cross-modal
-# RIT   : image (If) queries text (Tm) — cross-modal
-# RII   : image self-attention
+# Tf    : Final text feature vector   (BERT [CLS], projected to fusion_dim)
+# If    : Final image feature vector  (EfficientNetV2 GAP, projected to fusion_dim)
+# RTI   : text (Tf) queries image spatial sequence (Im_seq)
+# RIT   : image (If) queries BERT token sequence (Tm_seq) 
+# RII   : image spatial self-attention (Im_seq)
 #
-# Per paper: after each attention block, output is passed through FC layers,
-# then a residual connection is added, then LayerNorm is applied (Post-LN).
+# Im_seq : (B, H*W, fusion_dim) 
+# Tm_seq : (B, seq_len, fusion_dim)
 
 class _AttentionBlock(nn.Module):
     def __init__(self, fusion_dim: int, dropout: float):
         super().__init__()
-        self.attn = ScaledDotProductAttention(fusion_dim)
+        self.attn = ScaledDotProductAttention(fusion_dim, attn_dropout=0.1)
 
-        # 4 parallel FC layers (paper: "four different fully connected layers with size 32")
         self.fc_layers = nn.ModuleList([
-            nn.Sequential(nn.Linear(fusion_dim, fusion_dim), nn.Dropout(dropout))
+            nn.Sequential(nn.Linear(fusion_dim, fusion_dim), nn.GELU(), nn.Dropout(dropout))
             for _ in range(4)
         ])
 
-        # 1 additional FC after max-pool + residual (paper: "pass it into another fully connected layer")
         self.fc_out  = nn.Linear(fusion_dim, fusion_dim)
         self.dropout = nn.Dropout(dropout)
-
-        # LayerNorm on the output of the attention block 
-        self.norm = nn.LayerNorm(fusion_dim)
+        self.norm    = nn.LayerNorm(fusion_dim)
 
     def forward(self, q, k, v):
-        attn_out = self.attn(q=q, k=k, v=v)   # (B, D)  — residual base
+        attn_out = self.attn(q=q, k=k, v=v) 
 
-        # 4 FC projections stacked along a new dim for max-pool
-        fc_outs = torch.stack([fc(attn_out) for fc in self.fc_layers], dim=1)  # (B, 4, D)
-        pooled  = fc_outs.max(dim=1).values                                     # (B, D)
+        if attn_out.dim() == 3:
+            attn_out = attn_out.mean(dim=1)   
 
-        # Additional FC + residual connection from attention output
-        out = self.dropout(self.fc_out(pooled)) + attn_out   # (B, D)
+        fc_outs = torch.stack([fc(attn_out) for fc in self.fc_layers], dim=1) 
+        pooled  = fc_outs.max(dim=1).values                                    
 
-        # Post-LN
+        out = self.dropout(self.fc_out(pooled)) + attn_out  
         return self.norm(out)
 
 
 class FusionModule(nn.Module):
-    def __init__(self, fusion_dim: int, dropout: float = 0.1):
+    def __init__(self, fusion_dim: int, dropout: float = 0.1,
+                 vis_seq_dim: int = None, bert_seq_dim: int = None):
         super().__init__()
-        # Three attention blocks, each with full post-attention processing
-        self.AttTI = _AttentionBlock(fusion_dim, dropout)   # text queries image
-        self.AttIT = _AttentionBlock(fusion_dim, dropout)   # image queries text
-        self.AttII = _AttentionBlock(fusion_dim, dropout)   # image self-attention
 
-        # LayerNorm on individual modalities before fusion prevents one modality
-        # from dominating the attention scores (implementation choice, not in paper).
+        # Three attention blocks
+        self.AttTI = _AttentionBlock(fusion_dim, dropout)   # text queries image spatial seq
+        self.AttIT = _AttentionBlock(fusion_dim, dropout)   # image queries BERT token seq
+        self.AttII = _AttentionBlock(fusion_dim, dropout)   # image spatial self-attention
+
+        # Project spatial image features
+        self.im_seq_proj = nn.Sequential(
+            nn.Linear(vis_seq_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        ) if vis_seq_dim is not None else nn.Identity()
+
+        # Project BERT token hidden states
+        self.tm_seq_proj = nn.Sequential(
+            nn.Linear(bert_seq_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        ) if bert_seq_dim is not None else nn.Identity()
+
         self.norm_text  = nn.LayerNorm(fusion_dim)
         self.norm_image = nn.LayerNorm(fusion_dim)
 
         # Projection of concatenated 5 representations
         self.fusion_proj = nn.Sequential(
             nn.Linear(fusion_dim * 5, fusion_dim * 2),
+            nn.GELU(),
             nn.Dropout(dropout),
         )
 
@@ -121,38 +128,42 @@ class FusionModule(nn.Module):
 
     def forward(
         self,
-        Tf: torch.Tensor,   # final text feature  (B, D)
-        If: torch.Tensor,   # final image feature (B, D)
+        Tf: torch.Tensor,       
+        If: torch.Tensor,       
+        Im_seq: torch.Tensor,   
+        Tm_seq: torch.Tensor,    
     ) -> torch.Tensor:
 
-        # Normalise individual modalities (implementation choice for stability)
+        # Normalise pooled modality vectors
         Tf = self.norm_text(Tf)
         If = self.norm_image(If)
 
-        # Im and Tm are approximated by If and Tf respectively.
-        # In the original paper Im is a 2D spatial tensor from VGG-19 (49 × 32).
-        # Here EfficientNetV2 outputs a pooled vector, so Im = If is a known simplification.
-        Im = If
-        Tm = Tf
+        # Project sequences to fusion_dim
+        Im_seq = self.im_seq_proj(Im_seq)  
+        Tm_seq = self.tm_seq_proj(Tm_seq)  
 
-        RTI = self.AttTI(q=Tf, k=Im, v=Im)   # (B, D) — text queries image regions
-        RIT = self.AttIT(q=If, k=Tm, v=Tm)   # (B, D) — image queries text
-        RII = self.AttII(q=Im, k=Im, v=Im)   # (B, D) — image self-attention
+        # RTI: text vector queries real image spatial regions
+        RTI = self.AttTI(q=Tf, k=Im_seq, v=Im_seq)  
 
-        # Concatenate 5 representations (Tuan & Pham 2021, Sec. III-D)
-        fused = torch.cat([Tf, If, RTI, RIT, RII], dim=-1)   # (B, D*5)
-        fused = self.fusion_proj(fused)                       # (B, D*2)
+        # RIT: image vector queries real BERT token sequence
+        RIT = self.AttIT(q=If, k=Tm_seq, v=Tm_seq)  
+
+        # RII: spatial image self-attention
+        RII = self.AttII(q=Im_seq, k=Im_seq, v=Im_seq)  
+
+        # Concatenate 5 representations
+        fused = torch.cat([Tf, If, RTI, RIT, RII], dim=-1)   
+        fused = self.fusion_proj(fused)                        
         return self.dropout(fused)
 
 
 class MultimodalFakeNewsDetector(nn.Module):
     def __init__(
         self,
-        vision_model_name = VISION_MODEL,
-        bert_model_name   = BERT_MODEL,
+        vision_model_name = VISION_MODEL_NAME,
+        bert_model_name   = BERT_MODEL_NAME,
         num_classes       = 2,
         fusion_dim        = FUSION_DIM,
-        num_attn_heads    = NUM_ATTN_HEADS,
         drop_rate         = DROP_RATE,
         mode              = "multimodal",
     ):
@@ -161,20 +172,31 @@ class MultimodalFakeNewsDetector(nn.Module):
         use_vision = mode in ("multimodal", "vision_only")
         use_text   = mode in ("multimodal", "text_only")
 
+        vis_seq_dim  = None
+        bert_seq_dim = None
+
         # Vision backbone
         if use_vision:
             self.vision_encoder = timm.create_model(
                 vision_model_name, pretrained=True, num_classes=0,
+                features_only=True, out_indices=(-1,),
                 drop_rate=drop_rate,
             )
-            vis_dim = self.vision_encoder.num_features
+
+            vis_seq_dim = self.vision_encoder.feature_info[-1]["num_chs"]
+
+            self.gap = nn.AdaptiveAvgPool2d(1)
+
             self.vis_proj = nn.Sequential(
+                nn.Linear(vis_seq_dim, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.GELU(),
                 nn.Dropout(drop_rate),
-                nn.Linear(vis_dim, fusion_dim),
             )
         else:
             self.vision_encoder = None
             self.vis_proj       = None
+            self.gap            = None
 
         # Text backbone
         if use_text:
@@ -184,15 +206,14 @@ class MultimodalFakeNewsDetector(nn.Module):
             self.bert = BertModel.from_pretrained(
                 bert_model_name, config=bert_config
             )
-            bert_dim = bert_config.hidden_size
+            bert_seq_dim = bert_config.hidden_size 
 
-            # Freeze BERT pooler
-            # for p in self.bert.pooler.parameters():
-            #     p.requires_grad = False
-
+            # Project [CLS] to fusion_dim  →  Tf
             self.text_proj = nn.Sequential(
+                nn.Linear(bert_seq_dim, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.GELU(),
                 nn.Dropout(drop_rate),
-                nn.Linear(bert_dim, fusion_dim),
             )
         else:
             self.bert      = None
@@ -200,34 +221,49 @@ class MultimodalFakeNewsDetector(nn.Module):
 
         # Fusion
         if mode == "multimodal":
-            self.fusion = FusionModule(fusion_dim=fusion_dim, dropout=drop_rate)
-            fused_dim   = fusion_dim * 2
+            self.fusion = FusionModule(
+                fusion_dim   = fusion_dim,
+                dropout      = drop_rate,
+                vis_seq_dim  = vis_seq_dim,    
+                bert_seq_dim = bert_seq_dim,   
+            )
+            fused_dim = fusion_dim * 2
         else:
             self.fusion = None
             fused_dim   = fusion_dim
 
         # Classifier head
         self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
+            nn.Linear(fused_dim, fused_dim // 2),
+            nn.GELU(),
             nn.Dropout(drop_rate),
-            nn.Linear(fused_dim, num_classes),
+            nn.Linear(fused_dim // 2, num_classes),
         )
 
     def forward(self, images, input_ids, attention_mask):
         if self.mode == "multimodal":
-            If    = self.vis_proj(self.vision_encoder(images))
-            Tf    = self.text_proj(
-                self.bert(input_ids=input_ids,
-                          attention_mask=attention_mask).last_hidden_state[:, 0, :]
-            )
-            fused = self.fusion(Tf, If)
+            # Vision 
+            feat_map = self.vision_encoder(images)[-1]
+            Im_seq = feat_map.flatten(2).transpose(1, 2)
+            If = self.vis_proj(self.gap(feat_map).flatten(1))
+
+            # Text 
+            bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+            Tm_seq = bert_out.last_hidden_state 
+            Tf = self.text_proj(Tm_seq[:, 0, :])
+
+            # Fusion 
+            fused = self.fusion(Tf, If, Im_seq, Tm_seq)
 
         elif self.mode == "vision_only":
-            fused = self.vis_proj(self.vision_encoder(images))
+            feat_map = self.vision_encoder(images)[-1]
+            fused = self.vis_proj(self.gap(feat_map).flatten(1))
 
-        else:
+        else:  # text_only
             cls_out = self.bert(
                 input_ids=input_ids,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
             ).last_hidden_state[:, 0, :]
             fused = self.text_proj(cls_out)
 
@@ -238,7 +274,7 @@ class MultimodalFakeNewsDetector(nn.Module):
         with torch.no_grad():
             logits = self(images, input_ids, attention_mask)
             probs  = F.softmax(logits, dim=-1)
-            p_fake = probs[:, 0]; p_real = probs[:, 1]
+            p_fake = probs[:, 1]; p_real = probs[:, 0]
             preds  = logits.argmax(dim=-1)
         return preds.tolist(), (p_fake * 100).tolist(), (p_real * 100).tolist()
 

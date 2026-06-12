@@ -5,15 +5,15 @@ import easyocr
 from PIL import Image
 from transformers import BertTokenizer
 
-from config import DEVICE, BERT_MODEL, MAX_SEQ_LEN
+from config import DEVICE, BERT_MODEL_NAME, MAX_SEQ_LEN
 from model import MultimodalFakeNewsDetector
 from preprocessing import preprocess_ocr_text, eval_transform
 
 # List of models
 MODEL_REGISTRY = [
-    ("Multimodal",   "model/multimodal.pt",   "multimodal",  "Fake", "Real"),
-    ("Vision",   "model/vision.pt",   "vision_only",  "Fake", "Real"),
-    ("Text",   "model/text.pt",   "text_only",  "Fake", "Real"),
+    ("Multimodal",   "model/Multimodal.pt",   "multimodal",  "Fake", "Real"),
+    ("Unimodal Visual",   "model/Vision.pt",   "vision_only",  "Fake", "Real"),
+    ("Unimodal Textual",   "model/Text.pt",   "text_only",  "Fake", "Real"),
 ]
 
 _PLACEHOLDER = "(Pilih model)"
@@ -37,15 +37,13 @@ def load_model(model_name):
     _, model_path, mode, label_fake, label_real = _REGISTRY_MAP[model_name]
 
     try:
-        tokenizer  = BertTokenizer.from_pretrained(BERT_MODEL)
+        tokenizer  = BertTokenizer.from_pretrained(BERT_MODEL_NAME)
         ocr_reader = easyocr.Reader(["id", "en"], gpu=torch.cuda.is_available())
 
         model = MultimodalFakeNewsDetector(mode=mode).to(DEVICE)
 
-        # weights_only=False agar checkpoint lama (non-safetensors) tetap bisa dimuat
         ckpt = torch.load(model_path, map_location=DEVICE, weights_only=False)
 
-        # Tangani format checkpoint: dict terbungkus maupun state_dict langsung
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
         elif isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -61,9 +59,9 @@ def load_model(model_name):
             tokenizer=tokenizer,
             ocr_reader=ocr_reader,
             mode=mode,
-            label_map={0: label_fake, 1: label_real},
+            label_map={0: label_real, 1: label_fake},
         )
-        return f"✅ Model berhasil dimuat\nNama  : {model_name}\nMode  : {mode}"
+        return f"✅ Model berhasil dimuat\nNama  : {model_name}"
 
     except FileNotFoundError:
         return f"❌ File tidak ditemukan:\n{model_path}"
@@ -75,9 +73,18 @@ def load_model(model_name):
 
 def classify(image):
     if state["model"] is None:
-        return "⚠️ Model belum dimuat. Muat model terlebih dahulu."
+        return (
+            "⚠️ Model belum dimuat.",
+            {"Error": 1.0},
+            gr.update(visible=False)
+        )
+
     if image is None:
-        return "⚠️ Unggah citra terlebih dahulu."
+        return (
+            "⚠️ Unggah citra terlebih dahulu.",
+            {"Error": 1.0},
+            gr.update(visible=False)
+        )
 
     try:
         img_t = eval_transform(
@@ -85,8 +92,13 @@ def classify(image):
         ).unsqueeze(0).to(DEVICE)
 
         raw_text = " ".join(
-            state["ocr_reader"].readtext(image, detail=0, paragraph=True)
+            state["ocr_reader"].readtext(
+                image,
+                detail=0,
+                paragraph=True
+            )
         )
+
         text = preprocess_ocr_text(raw_text)
 
         enc = state["tokenizer"](
@@ -96,25 +108,48 @@ def classify(image):
             truncation=True,
             return_tensors="pt",
         )
-        input_ids      = enc["input_ids"].to(DEVICE)
+
+        input_ids = enc["input_ids"].to(DEVICE)
         attention_mask = enc["attention_mask"].to(DEVICE)
 
         with torch.no_grad():
-            logits = state["model"](img_t, input_ids, attention_mask)
-            probs  = F.softmax(logits, dim=-1)[0]
-            pred   = logits.argmax(dim=-1).item()
+            logits = state["model"](
+                img_t,
+                input_ids,
+                attention_mask
+            )
 
-        lf = state["label_map"][0]
-        lr = state["label_map"][1]
+            probs = F.softmax(logits, dim=-1)[0]
+            pred = logits.argmax(dim=-1).item()
 
-        return (
-            f"Prediksi  : {state['label_map'][pred]}\n"
-            f"{lf:<12}: {probs[0].item() * 100:.1f}%\n"
-            f"{lr:<12}: {probs[1].item() * 100:.1f}"
-        )
+            pred_label = state["label_map"][pred]
+
+            confidence = {
+                state["label_map"][0]: float(probs[0]),
+                state["label_map"][1]: float(probs[1]),
+            }
+
+            show_ocr = state["mode"] in [
+                "multimodal",
+                "text_only"
+            ]
+
+            return (
+                pred_label,
+                confidence,
+                gr.update(
+                    value=text if text else "(Tidak ada teks terdeteksi)",
+                    visible=show_ocr
+                )
+            )
 
     except Exception as e:
-        return f"❌ Error saat klasifikasi:\n{e}"
+        return (
+            f"❌ Error: {e}",
+            {"Error": 1.0},
+            gr.update(visible=False)
+        )
+
 
 # Gradio UI 
 css = """
@@ -192,7 +227,7 @@ with gr.Blocks(
                 btn_load = gr.Button(
                     "MUAT MODEL", 
                     variant="primary"
-)
+                )
 
                 model_info = gr.Textbox(
                     label=None,
@@ -210,11 +245,22 @@ with gr.Blocks(
                 </div>
                 """)
 
-                result_box = gr.Textbox(
-                    label=None,
-                    show_label=False,
+                prediction_box = gr.Textbox(
+                    label="Prediksi",
+                    interactive=False
+                )
+
+                confidence_box = gr.Label(
+                    label="Confidence Score",
+                    num_top_classes=2,
+                    container=False
+                )
+
+                ocr_box = gr.Textbox(
+                    label="Hasil OCR",
                     interactive=False,
-                    lines=6
+                    lines=4,
+                    visible=False
                 )
 
     # Events
@@ -227,7 +273,11 @@ with gr.Blocks(
     btn_classify.click(
         fn=classify,
         inputs=image_input,
-        outputs=result_box
+        outputs=[
+            prediction_box,
+            confidence_box,
+            ocr_box
+        ]
     )
 
 if __name__ == "__main__":
