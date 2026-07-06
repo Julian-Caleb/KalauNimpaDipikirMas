@@ -61,13 +61,16 @@ def load_model(model_name):
             mode=mode,
             label_map={0: label_real, 1: label_fake},
         )
-        return f"✅ Model berhasil dimuat\nNama  : {model_name}"
+        return f"✅ Model berhasil dimuat\nNama  : {model_name}\nMode  : {mode}"
 
     except FileNotFoundError:
+        state.update(model=None, tokenizer=None, ocr_reader=None, mode=None, label_map=None)
         return f"❌ File tidak ditemukan:\n{model_path}"
     except RuntimeError as e:
+        state.update(model=None, tokenizer=None, ocr_reader=None, mode=None, label_map=None)
         return f"❌ Gagal memuat bobot model (kemungkinan arsitektur tidak cocok):\n{e}"
     except Exception as e:
+        state.update(model=None, tokenizer=None, ocr_reader=None, mode=None, label_map=None)
         return f"❌ Gagal memuat model:\n{e}"
 
 
@@ -76,14 +79,14 @@ def classify(image):
         return (
             "⚠️ Model belum dimuat.",
             {"Error": 1.0},
-            gr.update(visible=False)
+            ""
         )
 
     if image is None:
         return (
             "⚠️ Unggah citra terlebih dahulu.",
             {"Error": 1.0},
-            gr.update(visible=False)
+            ""
         )
 
     try:
@@ -134,20 +137,22 @@ def classify(image):
                 "text_only"
             ]
 
+            if show_ocr:
+                ocr_text = text if text else "(Tidak ada teks terdeteksi)"
+            else:
+                ocr_text = f"(Mode '{state['mode']}' tidak menggunakan OCR)"
+
             return (
                 pred_label,
                 confidence,
-                gr.update(
-                    value=text if text else "(Tidak ada teks terdeteksi)",
-                    visible=show_ocr
-                )
+                ocr_text
             )
 
     except Exception as e:
         return (
             f"❌ Error: {e}",
             {"Error": 1.0},
-            gr.update(visible=False)
+            ""
         )
 
 
@@ -259,8 +264,7 @@ with gr.Blocks(
                 ocr_box = gr.Textbox(
                     label="Hasil OCR",
                     interactive=False,
-                    lines=4,
-                    visible=False
+                    lines=4
                 )
 
     # Events

@@ -3,52 +3,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from transformers import BertModel
-from config import VISION_MODEL_NAME, BERT_MODEL_NAME, FUSION_DIM, DROP_RATE
+from config import VISION_MODEL_NAME, BERT_MODEL_NAME, FUSION_DIM, DROP_RATE, FUSION_NUM_HEADS
 
-
-# Scaled dot-product attention module for fusion
-class ScaledDotProductAttention(nn.Module):
-    def __init__(self, dim: int, attn_dropout: float = 0.1):
+# Multi-head attention module for fusion
+# Replaces the single-head ScaledDotProductAttention with nn.MultiheadAttention,
+# allowing the model to jointly attend to multiple representation subspaces.
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, attn_dropout: float = 0.1):
         super().__init__()
-        self.scale = dim ** -0.5
-
-        self.W_Q = nn.Linear(dim, dim, bias=False)
-        self.W_K = nn.Linear(dim, dim, bias=False)
-        self.W_V = nn.Linear(dim, dim, bias=False)
-
+        assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+        self.num_heads = num_heads
         self.norm_q = nn.LayerNorm(dim)
-
-        # Attention weight dropout
-        self.attn_drop = nn.Dropout(attn_dropout)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            batch_first=True,  # (B, seq, dim)
+        )
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         is_vec = (q.dim() == 2)
 
-        # Promote vectors to sequences for unified bmm path
+        # Promote vectors to sequences for unified path
         if is_vec:
-            q = q.unsqueeze(1)  
+            q = q.unsqueeze(1)   # (B, 1, dim)
         if k.dim() == 2:
-            k = k.unsqueeze(1)  
+            k = k.unsqueeze(1)
         if v.dim() == 2:
-            v = v.unsqueeze(1)  
+            v = v.unsqueeze(1)
 
         q = self.norm_q(q)
 
-        Q = self.W_Q(q) 
-        K = self.W_K(k) 
-        V = self.W_V(v) 
-
-        # Attention
-        scores  = torch.bmm(Q, K.transpose(1, 2)) * self.scale 
-        weights = self.attn_drop(torch.softmax(scores, dim=-1)) 
-        out     = torch.bmm(weights, V)                         
+        # nn.MultiheadAttention expects (B, seq, dim) when batch_first=True
+        out, _ = self.attn(query=q, key=k, value=v)
 
         # Return to original shape
         if is_vec:
-            out = out.squeeze(1)  
+            out = out.squeeze(1)  # (B, dim)
 
         return out
-
 
 # Five-input fusion module from Tuan & Pham (2021)
 #
@@ -62,41 +55,48 @@ class ScaledDotProductAttention(nn.Module):
 # Tm_seq : (B, seq_len, fusion_dim)
 
 class _AttentionBlock(nn.Module):
-    def __init__(self, fusion_dim: int, dropout: float):
+    def __init__(self, fusion_dim: int, dropout: float, num_heads: int = FUSION_NUM_HEADS):
         super().__init__()
-        self.attn = ScaledDotProductAttention(fusion_dim, attn_dropout=0.1)
+        self.norm_attn = nn.LayerNorm(fusion_dim)
+        self.attn      = MultiHeadCrossAttention(fusion_dim, num_heads=num_heads, attn_dropout=0.1)
 
-        self.fc_layers = nn.ModuleList([
-            nn.Sequential(nn.Linear(fusion_dim, fusion_dim), nn.GELU(), nn.Dropout(dropout))
-            for _ in range(4)
-        ])
-
-        self.fc_out  = nn.Linear(fusion_dim, fusion_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.norm    = nn.LayerNorm(fusion_dim)
+        # Standard FFN: expand to 4× then project back (same total params as old 4×FC)
+        self.norm_ffn = nn.LayerNorm(fusion_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim * 4, fusion_dim),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, q, k, v):
-        attn_out = self.attn(q=q, k=k, v=v) 
+        # Pre-norm attention with residual
+        q_norm   = self.norm_attn(q) if q.dim() == 2 else self.norm_attn(q)
+        attn_out = self.attn(q=q_norm, k=k, v=v)
 
         if attn_out.dim() == 3:
-            attn_out = attn_out.mean(dim=1)   
+            attn_out = attn_out.mean(dim=1)
+        if q.dim() == 3:
+            q = q.mean(dim=1)
 
-        fc_outs = torch.stack([fc(attn_out) for fc in self.fc_layers], dim=1) 
-        pooled  = fc_outs.max(dim=1).values                                    
+        x = q + attn_out                    # residual around attention
 
-        out = self.dropout(self.fc_out(pooled)) + attn_out  
-        return self.norm(out)
+        # Pre-norm FFN with residual
+        out = x + self.ffn(self.norm_ffn(x))
+        return out
 
 
 class FusionModule(nn.Module):
     def __init__(self, fusion_dim: int, dropout: float = 0.1,
-                 vis_seq_dim: int = None, bert_seq_dim: int = None):
+                 vis_seq_dim: int = None, bert_seq_dim: int = None,
+                 num_heads: int = FUSION_NUM_HEADS):
         super().__init__()
 
-        # Three attention blocks
-        self.AttTI = _AttentionBlock(fusion_dim, dropout)   # text queries image spatial seq
-        self.AttIT = _AttentionBlock(fusion_dim, dropout)   # image queries BERT token seq
-        self.AttII = _AttentionBlock(fusion_dim, dropout)   # image spatial self-attention
+        # Three multi-head attention blocks
+        self.AttTI = _AttentionBlock(fusion_dim, dropout, num_heads)   # text queries image spatial seq
+        self.AttIT = _AttentionBlock(fusion_dim, dropout, num_heads)   # image queries BERT token seq
+        self.AttII = _AttentionBlock(fusion_dim, dropout, num_heads)   # image spatial self-attention
 
         # Project spatial image features
         self.im_seq_proj = nn.Sequential(
@@ -123,8 +123,6 @@ class FusionModule(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-
-        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -154,7 +152,7 @@ class FusionModule(nn.Module):
         # Concatenate 5 representations
         fused = torch.cat([Tf, If, RTI, RIT, RII], dim=-1)   
         fused = self.fusion_proj(fused)                        
-        return self.dropout(fused)
+        return fused
 
 
 class MultimodalFakeNewsDetector(nn.Module):
@@ -224,8 +222,9 @@ class MultimodalFakeNewsDetector(nn.Module):
             self.fusion = FusionModule(
                 fusion_dim   = fusion_dim,
                 dropout      = drop_rate,
-                vis_seq_dim  = vis_seq_dim,    
-                bert_seq_dim = bert_seq_dim,   
+                vis_seq_dim  = vis_seq_dim,
+                bert_seq_dim = bert_seq_dim,
+                num_heads    = FUSION_NUM_HEADS,
             )
             fused_dim = fusion_dim * 2
         else:
@@ -277,4 +276,3 @@ class MultimodalFakeNewsDetector(nn.Module):
             p_fake = probs[:, 1]; p_real = probs[:, 0]
             preds  = logits.argmax(dim=-1)
         return preds.tolist(), (p_fake * 100).tolist(), (p_real * 100).tolist()
-
