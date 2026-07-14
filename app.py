@@ -156,7 +156,7 @@ def classify(image):
         )
 
 
-# Gradio UI 
+# Gradio UI
 css = """
 .container {
     max-width: 1200px;
