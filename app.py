@@ -16,7 +16,7 @@ MODEL_REGISTRY = [
     ("Unimodal Textual",   "model/Text.pt",   "text_only",  "Fake", "Real"),
 ]
 
-_PLACEHOLDER = "(Pilih model)"
+_PLACEHOLDER = "(Select model)"
 DROPDOWN_CHOICES = [_PLACEHOLDER] + [entry[0] for entry in MODEL_REGISTRY]
 _REGISTRY_MAP = {entry[0]: entry for entry in MODEL_REGISTRY}
 
@@ -32,7 +32,7 @@ state = {
 
 def load_model(model_name):
     if model_name == _PLACEHOLDER or model_name is None:
-        return "⚠️ Pilih model terlebih dahulu."
+        return "⚠️ Select a model first."
 
     _, model_path, mode, label_fake, label_real = _REGISTRY_MAP[model_name]
 
@@ -61,30 +61,30 @@ def load_model(model_name):
             mode=mode,
             label_map={0: label_real, 1: label_fake},
         )
-        return f"✅ Model berhasil dimuat\nNama  : {model_name}\nMode  : {mode}"
+        return f"✅ Model successfully loaded\nName  : {model_name}\nMode  : {mode}"
 
     except FileNotFoundError:
         state.update(model=None, tokenizer=None, ocr_reader=None, mode=None, label_map=None)
-        return f"❌ File tidak ditemukan:\n{model_path}"
+        return f"❌ File not found:\n{model_path}"
     except RuntimeError as e:
         state.update(model=None, tokenizer=None, ocr_reader=None, mode=None, label_map=None)
-        return f"❌ Gagal memuat bobot model (kemungkinan arsitektur tidak cocok):\n{e}"
+        return f"❌ Failed to load model weights (possible architecture mismatch):\n{e}"
     except Exception as e:
         state.update(model=None, tokenizer=None, ocr_reader=None, mode=None, label_map=None)
-        return f"❌ Gagal memuat model:\n{e}"
+        return f"❌ Failed to load model:\n{e}"
 
 
 def classify(image):
     if state["model"] is None:
         return (
-            "⚠️ Model belum dimuat.",
+            "⚠️ Model not loaded.",
             {"Error": 1.0},
             ""
         )
 
     if image is None:
         return (
-            "⚠️ Unggah citra terlebih dahulu.",
+            "⚠️ Please upload an image first.",
             {"Error": 1.0},
             ""
         )
@@ -138,9 +138,9 @@ def classify(image):
             ]
 
             if show_ocr:
-                ocr_text = text if text else "(Tidak ada teks terdeteksi)"
+                ocr_text = text if text else "(No text detected)"
             else:
-                ocr_text = f"(Mode '{state['mode']}' tidak menggunakan OCR)"
+                ocr_text = f"(Mode '{state['mode']}' does not use OCR)"
 
             return (
                 pred_label,
@@ -184,14 +184,14 @@ css = """
 """
 
 with gr.Blocks(
-    title="Deteksi Citra Berita",
+    title="TEXT OVERWRITING MANIPULATION DETECTOR",
     css=css,
     theme=gr.themes.Default(),
 ) as demo:
 
     gr.Markdown(
         """
-        # DETEKSI CITRA BERITA MENGANDUNG TEKS
+        # TEXT OVERWRITING MANIPULATION DETECTOR
         """
     )
 
@@ -201,13 +201,13 @@ with gr.Blocks(
         with gr.Column(scale=1, min_width=350):
 
             image_input = gr.Image(
-                label="Citra",
+                label="Image",
                 height=320,
                 type="numpy"
             )
 
             btn_classify = gr.Button(
-                "KLASIFIKASI",
+                "CLASSIFY",
                 variant="primary"
             )
 
@@ -219,18 +219,18 @@ with gr.Blocks(
 
                 gr.HTML("""
                 <div class="section-title">
-                    <h3>MODEL YANG DIGUNAKAN</h3>
+                    <h3>MODEL USED</h3>
                 </div>
                 """)
 
                 model_select = gr.Dropdown(
                     choices=DROPDOWN_CHOICES,
                     value=_PLACEHOLDER,
-                    label="Pilih Model"
+                    label="Select Model"
                 )
 
                 btn_load = gr.Button(
-                    "MUAT MODEL", 
+                    "LOAD MODEL", 
                     variant="primary"
                 )
 
@@ -246,12 +246,12 @@ with gr.Blocks(
 
                 gr.HTML("""
                 <div class="section-title">
-                    <h3>HASIL KLASIFIKASI</h3>
+                    <h3>CLASSIFICATION RESULTS</h3>
                 </div>
                 """)
 
                 prediction_box = gr.Textbox(
-                    label="Prediksi",
+                    label="Prediction",
                     interactive=False
                 )
 
@@ -262,7 +262,7 @@ with gr.Blocks(
                 )
 
                 ocr_box = gr.Textbox(
-                    label="Hasil OCR",
+                    label="OCR Results",
                     interactive=False,
                     lines=4
                 )
